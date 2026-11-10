@@ -1,0 +1,85 @@
+# Builds the Windows NSIS and MSI installers and uploads them as a workflow artifact.
+#
+# Mirrors the toolchain and addon build of windows.yml, then runs the packaging step that
+# docs/install.md describes for building the installers from source.
+name: Package Windows installer
+
+on:
+  push:
+    branches: [feat/windows-installer]
+  workflow_dispatch:
+
+concurrency:
+  group: package-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  installer:
+    name: NSIS installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE: '["gentle-pi@4.7.0"]'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - run: pnpm install --frozen-lockfile
+
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Build app-channel addon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = node -p process.version
+          $inputs = Join-Path $env:RUNNER_TEMP 'node-addon-inputs'
+          New-Item -ItemType Directory -Force -Path $inputs | Out-Null
+          $release = "https://nodejs.org/download/release/$version"
+          Invoke-WebRequest "$release/node-$version-headers.tar.gz" -OutFile "$inputs/headers.tar.gz"
+          Invoke-WebRequest "$release/win-x64/node.lib" -OutFile "$inputs/node.lib"
+          $sums = (Invoke-WebRequest "$release/SHASUMS256.txt").Content -split "`n"
+          foreach ($pair in @(@("node-$version-headers.tar.gz", 'headers.tar.gz'), @('win-x64/node.lib', 'node.lib'))) {
+            $line = $sums | Where-Object { $_ -match "^[0-9a-f]{64}\s+$([regex]::Escape($pair[0]))$" }
+            if (-not $line) { throw "No published checksum for $($pair[0])" }
+            $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $inputs $pair[1])).Hash.ToLowerInvariant()
+            if ($actual -ne ($line -split '\s+')[0]) { throw "Checksum mismatch for $($pair[0])" }
+          }
+          tar -xf "$inputs/headers.tar.gz" -C $inputs
+          if ($LASTEXITCODE -ne 0) { throw 'Node header extraction failed' }
+          $compiler = (Get-Command cl.exe).Source
+          pnpm --filter @gentle-dot/daemon run build:windows-stop -- --compiler "$compiler" --headers "$inputs/node-$version/include/node" --node-lib "$inputs/node.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Native addon build failed' }
+
+      # GENTLE_DOT_BUILD_GO must name the real go.exe in GOROOT\bin, not a shim. package:windows
+      # stages the runtime itself; --check extracts both installers with the runner's 7-Zip and
+      # msiexec and compares their payload with the staged runtime.
+      - name: Package installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:GENTLE_DOT_BUILD_GO = Join-Path (go env GOROOT) 'bin\go.exe'
+          pnpm package:windows --check
+          if ($LASTEXITCODE -ne 0) { throw 'Installer packaging failed' }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gentle-dot-windows-x64
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+            apps/desktop/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
